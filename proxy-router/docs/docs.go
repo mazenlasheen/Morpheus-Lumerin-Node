@@ -873,6 +873,12 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/structs.OpenSessionRes"
                         }
+                    },
+                    "409": {
+                        "description": "Conflict",
+                        "schema": {
+                            "$ref": "#/definitions/structs.ExistingSessionRes"
+                        }
                     }
                 }
             }
@@ -4526,6 +4532,15 @@ const docTemplate = `{
                 }
             }
         },
+        "structs.ExistingSessionRes": {
+            "type": "object",
+            "properties": {
+                "existingSessionID": {
+                    "type": "string",
+                    "example": "0x1234"
+                }
+            }
+        },
         "structs.OpenSessionRes": {
             "type": "object",
             "properties": {
@@ -4550,6 +4565,10 @@ const docTemplate = `{
                     "type": "boolean"
                 },
                 "failover": {
+                    "type": "boolean"
+                },
+                "rejectExisting": {
+                    "description": "RejectExisting asks the router to refuse this open when the wallet already\nhas a live session for the same model. It is opt-in so existing API and\nmobile callers that intentionally manage multiple sessions keep their\ncurrent behaviour.",
                     "type": "boolean"
                 },
                 "omitProvider": {
