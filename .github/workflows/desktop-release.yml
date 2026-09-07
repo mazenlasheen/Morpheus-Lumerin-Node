@@ -1,0 +1,265 @@
+name: Desktop Release
+
+# Builds the desktop app for macOS (Apple Silicon and Intel) and Windows x64,
+# then publishes them as assets on a GitHub Release.
+#
+# The repository's main CI-CD pipeline (build.yml) gates every job on
+# `github.repository == 'MorpheusAIs/Morpheus-Lumerin-Node'` and deploys to AWS,
+# so it never runs on a fork. This workflow is the fork's own release path: it
+# builds the same artifacts and needs no secrets beyond the token GitHub already
+# provides.
+#
+# Two ways to run it:
+#   • Actions tab -> Desktop Release -> Run workflow, and fill in the version.
+#   • Push a tag:  git tag desktop-v1.0.0 && git push origin desktop-v1.0.0
+#
+# The binaries are NOT code-signed. See the release notes this generates for
+# what users have to do about that.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version for the build, without a leading v (e.g. 1.0.0)"
+        required: true
+        type: string
+      network:
+        description: "Which chain the build points at"
+        required: true
+        default: testnet
+        type: choice
+        options:
+          - testnet
+          - mainnet
+      prerelease:
+        description: "Mark the release as a pre-release"
+        required: false
+        default: true
+        type: boolean
+
+  push:
+    tags:
+      - "desktop-v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: desktop-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  settings:
+    name: Resolve version and network
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      network: ${{ steps.resolve.outputs.network }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+    steps:
+      - name: Resolve
+        id: resolve
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION='${{ inputs.version }}'
+            NETWORK='${{ inputs.network }}'
+            PRERELEASE='${{ inputs.prerelease }}'
+          else
+            # refs/tags/desktop-v1.0.0 -> 1.0.0. Tag builds default to testnet;
+            # use the manual dispatch to cut a mainnet build deliberately.
+            VERSION="${GITHUB_REF_NAME#desktop-v}"
+            NETWORK=testnet
+            PRERELEASE=true
+          fi
+
+          # electron-builder puts this straight into filenames and Info.plist,
+          # so reject anything that is not a plain semver before 30 minutes of
+          # build time go by.
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$'; then
+            echo "::error::'$VERSION' is not a valid version (expected e.g. 1.0.0 or 1.0.0-rc.1)"
+            exit 1
+          fi
+
+          echo "version=$VERSION"       >> "$GITHUB_OUTPUT"
+          echo "network=$NETWORK"       >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "| | |"
+            echo "|---|---|"
+            echo "| version | \`$VERSION\` |"
+            echo "| network | \`$NETWORK\` |"
+            echo "| pre-release | \`$PRERELEASE\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: ${{ matrix.label }}
+    needs: settings
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing should not cost the other two their build.
+      fail-fast: false
+      matrix:
+        include:
+          - label: macOS (Apple Silicon)
+            os: macos-14
+            script: build:mac-arm64
+            artifact: mac-arm64
+            glob: "ui-desktop/dist/*.dmg"
+          - label: macOS (Intel)
+            os: macos-13
+            script: build:mac-x64
+            artifact: mac-x64
+            glob: "ui-desktop/dist/*.dmg"
+          - label: Windows (x64)
+            os: windows-latest
+            script: build:win-x64
+            artifact: win-x64
+            glob: "ui-desktop/dist/*.exe"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+          cache: yarn
+          cache-dependency-path: ui-desktop/yarn.lock
+
+      # The packaged app ships a proxy-router binary that electron-builder's
+      # beforePack hook compiles with `go build`, so Go is a build dependency of
+      # the desktop app even though nothing here is a Go project.
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25.x"
+          cache-dependency-path: proxy-router/go.sum
+
+      # node-gyp reaches for distutils, which Python 3.12 removed.
+      - name: Install setuptools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install python-setuptools
+
+      - name: Install dependencies
+        working-directory: ui-desktop
+        run: yarn install --network-timeout 600000 --frozen-lockfile
+
+      - name: Select the chain configuration
+        shell: bash
+        run: |
+          cp ".github/workflows/${{ needs.settings.outputs.network }}.env" ui-desktop/.env
+          echo "Using ${{ needs.settings.outputs.network }}.env:"
+          sed 's/^/  /' ui-desktop/.env
+
+      # The version in package.json is what electron-builder stamps into the
+      # filename and the app itself, so it is set here rather than committed.
+      - name: Set the version
+        shell: bash
+        working-directory: ui-desktop
+        run: |
+          node -e '
+            const fs = require("fs");
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            pkg.version = process.argv[1];
+            fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
+          ' "${{ needs.settings.outputs.version }}"
+          grep '"version"' package.json
+
+      - name: Build
+        working-directory: ui-desktop
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
+        run: yarn ${{ matrix.script }}
+
+      - name: Upload
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.glob }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish the release
+    needs: [settings, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect the installers
+        uses: actions/download-artifact@v7
+        with:
+          path: installers
+          merge-multiple: true
+
+      - name: List what will be published
+        run: ls -lh installers | sed 's/^/  /'
+
+      - name: Write the release notes
+        run: |
+          cat > notes.md <<'EOF'
+          Desktop builds of the Morpheus node UI.
+
+          ## Which file do I want
+
+          | You have | Download |
+          |---|---|
+          | Mac with Apple Silicon (M1-M4) | `mac-arm64-...dmg` |
+          | Mac with an Intel chip | `mac-x64-...dmg` |
+          | Windows 64-bit | `win-x64-...exe` |
+
+          Not sure which Mac you have: Apple menu -> About This Mac. "Apple M..." means Apple Silicon.
+
+          ## Installing
+
+          **macOS.** Open the `.dmg` and drag the app to Applications. These builds are
+          not signed with an Apple Developer certificate, so the first launch will be
+          refused with "MorpheusUI is damaged and can't be opened". It is not damaged —
+          macOS is refusing an unsigned app. Clear the quarantine flag once:
+
+          ```
+          xattr -cr /Applications/MorpheusUI.app
+          ```
+
+          Then open it normally.
+
+          **Windows.** The `.exe` is portable: no installer, just run it. SmartScreen
+          will show a blue "Windows protected your PC" box because the binary is not
+          signed. Click **More info**, then **Run anyway**.
+
+          Signing these properly needs a paid Apple Developer certificate and a Windows
+          code-signing certificate. Until those exist, the warnings above are expected.
+          EOF
+
+          {
+            echo ""
+            echo "---"
+            echo ""
+            echo "Built from \`${{ github.sha }}\` against **${{ needs.settings.outputs.network }}**."
+          } >> notes.md
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: desktop-v${{ needs.settings.outputs.version }}
+        run: |
+          FLAGS=""
+          if [ "${{ needs.settings.outputs.prerelease }}" = "true" ]; then
+            FLAGS="--prerelease"
+          fi
+
+          # Re-running the workflow for the same version should replace the
+          # assets rather than fail on an existing tag.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG exists - replacing its assets."
+            gh release upload "$TAG" installers/* --clobber
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" installers/* \
+              --title "Desktop $TAG" \
+              --notes-file notes.md \
+              --target "${{ github.sha }}" \
+              $FLAGS
+          fi
+
+          echo "Published: $(gh release view "$TAG" --json url -q .url)" >> "$GITHUB_STEP_SUMMARY"
