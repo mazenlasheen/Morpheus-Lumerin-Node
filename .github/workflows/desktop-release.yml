@@ -151,11 +151,28 @@ jobs:
         # purpose - it is what the verified local build used.
         run: yarn install --network-timeout 600000 --frozen-lockfile --ignore-engines
 
+      # The env files are named after the chain rather than the network:
+      # main.env is BASE mainnet and test.env is BASE Sepolia. An earlier
+      # version of this step built the filename out of the network name, so the
+      # cp looked for testnet.env, found nothing and killed every build on
+      # every platform before a single artifact existed.
       - name: Select the chain configuration
         shell: bash
         run: |
-          cp ".github/workflows/${{ needs.settings.outputs.network }}.env" ui-desktop/.env
-          echo "Using ${{ needs.settings.outputs.network }}.env:"
+          case "${{ needs.settings.outputs.network }}" in
+            mainnet) ENV_FILE=.github/workflows/main.env ;;
+            testnet) ENV_FILE=.github/workflows/test.env ;;
+            *)
+              echo "::error::unknown network '${{ needs.settings.outputs.network }}'"
+              exit 1
+              ;;
+          esac
+          if [ ! -f "$ENV_FILE" ]; then
+            echo "::error::$ENV_FILE is missing"
+            exit 1
+          fi
+          cp "$ENV_FILE" ui-desktop/.env
+          echo "Using $ENV_FILE:"
           sed 's/^/  /' ui-desktop/.env
 
       # The version in package.json is what electron-builder stamps into the
