@@ -144,7 +144,12 @@ jobs:
 
       - name: Install dependencies
         working-directory: ui-desktop
-        run: yarn install --network-timeout 600000 --frozen-lockfile
+        # --ignore-engines: @testing-library/jest-dom@6 declares
+        # engines.node >=22 and yarn checks dev dependencies too, so on
+        # Node 20 the install aborts before anything is built. Packaging
+        # never loads that module. The Node version stays at 20 on
+        # purpose - it is what the verified local build used.
+        run: yarn install --network-timeout 600000 --frozen-lockfile --ignore-engines
 
       - name: Select the chain configuration
         shell: bash
