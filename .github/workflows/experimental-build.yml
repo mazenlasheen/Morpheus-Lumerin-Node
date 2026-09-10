@@ -1,0 +1,311 @@
+# .github/workflows/experimental-build.yml
+#
+# Fork-safe, on-demand build of the experimental MorpheusUI desktop app.
+#
+# Produces:  win-x64-morpheus-app-<version>.exe   (portable)
+#            mac-arm64-morpheus-app-<version>.dmg
+#            mac-x64-morpheus-app-<version>.dmg   (optional)
+#
+# WHY THIS IS ONE WORKFLOW AND NOT TWO:
+# The installers do NOT contain the proxy-router. At first launch the Electron
+# app downloads it from a URL that electron-vite baked into the bundle as a
+# string literal at BUILD time (orchestrator.config.ts reads
+# process.env.SERVICE_PROXY_DOWNLOAD_URL_*). So the router binaries must be
+# built and published to a predictable, PUBLICLY readable URL before the
+# installers are built. Hence: router -> release -> installers, in that order.
+#
+# PREREQUISITE: this repo must be public, or the app will 401 on first launch.
+# src/main/orchestrator/downloader.ts does a bare fetch(url) with no auth header.
+
+name: Experimental App Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Semver for this build (electron-builder requires valid semver)"
+        required: true
+        default: "0.0.0-exp"
+        type: string
+      network:
+        description: "Chain the app points at"
+        required: true
+        default: "testnet"
+        type: choice
+        options: [testnet, mainnet]
+      build_mac_intel:
+        description: "Also build the Intel (x64) .dmg"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  GO_VERSION: "1.25.x"
+  NODE_VERSION: "20"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Resolve the tag and the base URL the installers will be hard-wired to.
+  # ---------------------------------------------------------------------------
+  setup:
+    name: Resolve version and URLs
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ inputs.version }}
+      tag: exp-v${{ inputs.version }}
+      base_url: ${{ github.server_url }}/${{ github.repository }}/releases/download/exp-v${{ inputs.version }}
+    steps:
+      - name: Guard against a private repo
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VIS=$(gh api "repos/${{ github.repository }}" --jq .visibility)
+          echo "Repository visibility: $VIS"
+          if [ "$VIS" != "public" ]; then
+            echo "::warning::Repo is '$VIS'. Release assets need a token to download, but the" \
+                 "app fetches the proxy-router unauthenticated — first launch will fail with 401." \
+                 "Make the repo public, or point SERVICE_PROXY_DOWNLOAD_URL_* at your own host."
+          fi
+
+      - name: Summary
+        run: |
+          {
+            echo "### Experimental build"
+            echo "- version: \`${{ inputs.version }}\`"
+            echo "- tag: \`exp-v${{ inputs.version }}\`"
+            echo "- network: \`${{ inputs.network }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # 2. Cross-compile the Go proxy-router for every platform the app targets.
+  #    Asset names follow the upstream convention so nothing else has to change.
+  # ---------------------------------------------------------------------------
+  router:
+    name: Build proxy-router binaries
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: proxy-router/go.sum
+
+      - name: Build for win-x64, mac-arm64, mac-x64
+        working-directory: proxy-router
+        env:
+          V: ${{ needs.setup.outputs.version }}
+          TAG_NAME: ${{ needs.setup.outputs.tag }}
+        run: |
+          set -euo pipefail
+          chmod +x ./build.sh
+          go mod download
+
+          # build.sh always writes ./proxy-router, so rename after each pass.
+          GOOS=windows GOARCH=amd64 ./build.sh
+          mv proxy-router "win-x64-morpheus-router-${V}.exe"
+
+          GOOS=darwin GOARCH=arm64 ./build.sh
+          mv proxy-router "mac-arm64-morpheus-router-${V}"
+
+          GOOS=darwin GOARCH=amd64 ./build.sh
+          mv proxy-router "mac-x64-morpheus-router-${V}"
+
+          ls -la *morpheus-router*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: proxy-router-binaries
+          path: proxy-router/*morpheus-router-*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 3. Publish the router binaries FIRST, so the URL baked into the installers
+  #    is already live by the time anyone runs them.
+  # ---------------------------------------------------------------------------
+  release:
+    name: Create release with router binaries
+    needs: [setup, router]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: proxy-router-binaries
+          path: dist-router
+
+      - name: Recreate the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.setup.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Idempotent: a re-run of the same version replaces the old release.
+          gh release delete "$TAG" --yes --cleanup-tag || true
+          gh release create "$TAG" \
+            --target "${{ github.sha }}" \
+            --title "Experimental $TAG" \
+            --notes "Unsigned experimental build. Router binaries + desktop installers." \
+            --prerelease
+          gh release upload "$TAG" dist-router/* --clobber
+
+  # ---------------------------------------------------------------------------
+  # 4. Build the installers. .exe on Windows, .dmg on macOS — a .dmg genuinely
+  #    cannot be produced on any other OS, which is why this is a matrix.
+  # ---------------------------------------------------------------------------
+  app:
+    name: Build ${{ matrix.label }}
+    needs: [setup, release]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Windows x64 (.exe)
+            os: windows-latest
+            script: build:win-x64
+            artifact: win-x64-morpheus-app-${{ needs.setup.outputs.version }}.exe
+            enabled: true
+          - label: macOS arm64 (.dmg)
+            os: macos-latest
+            script: build:mac-arm64
+            artifact: mac-arm64-morpheus-app-${{ needs.setup.outputs.version }}.dmg
+            enabled: true
+          - label: macOS x64 (.dmg)
+            os: macos-15-intel
+            script: build:mac-x64
+            artifact: mac-x64-morpheus-app-${{ needs.setup.outputs.version }}.dmg
+            enabled: ${{ inputs.build_mac_intel }}
+    steps:
+      - name: Skip if disabled
+        if: matrix.enabled != true && matrix.enabled != 'true'
+        run: echo "Intel dmg not requested; skipping."
+
+      - uses: actions/checkout@v4
+        if: matrix.enabled == true || matrix.enabled == 'true'
+
+      - uses: actions/setup-node@v4
+        if: matrix.enabled == true || matrix.enabled == 'true'
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: yarn
+          cache-dependency-path: ui-desktop/yarn.lock
+
+      - name: Cache Electron downloads
+        if: matrix.enabled == true || matrix.enabled == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/electron
+            ~/.cache/electron-builder
+            ~/AppData/Local/electron
+            ~/AppData/Local/electron-builder
+          key: ${{ runner.os }}-electron-${{ hashFiles('ui-desktop/package.json') }}
+          restore-keys: ${{ runner.os }}-electron-
+
+      - name: macOS build prerequisites
+        if: runner.os == 'macOS' && (matrix.enabled == true || matrix.enabled == 'true')
+        run: brew install python-setuptools
+
+      # ---------------------------------------------------------------------
+      # The .env is the whole ballgame. electron.vite.config.ts validates it
+      # against EnvSchema with AJV and THROWS on any missing required key, so
+      # a wrong .env fails the build before a single file is bundled.
+      # Keys with schema defaults (ports, BYPASS_AUTH, DEV_TOOLS, ...) are
+      # deliberately omitted — AJV fills them in via useDefaults.
+      # ---------------------------------------------------------------------
+      - name: Write ui-desktop/.env
+        if: matrix.enabled == true || matrix.enabled == 'true'
+        working-directory: ui-desktop
+        env:
+          BASE: ${{ needs.setup.outputs.base_url }}
+          V: ${{ needs.setup.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.network }}" = "mainnet" ]; then
+            cat > .env <<EOF
+          BLOCKSCOUT_API_URL=https://base.blockscout.com/api/v2
+          CHAIN_ID=8453
+          CHAIN_NAME=Base
+          DIAMOND_ADDRESS=0x6aBE1d282f72B474E54527D93b979A4f64d3030a
+          EXPLORER_URL=https://basescan.org/tx/{{hash}}
+          TOKEN_ADDRESS=0x7431ada8a591c955a994a21710752ef9b882b8e3
+          EOF
+          else
+            cat > .env <<EOF
+          BLOCKSCOUT_API_URL=https://base-sepolia.blockscout.com/api/v2
+          CHAIN_ID=84532
+          CHAIN_NAME=Base Sepolia
+          DIAMOND_ADDRESS=0xA328196f2438DADA5ab729E39388D86896c27c85
+          EXPLORER_URL=https://sepolia.basescan.org/tx/{{hash}}
+          TOKEN_ADDRESS=0x5C80Ddd187054E1E4aBBfFCD750498e81d34FfA3
+          EOF
+          fi
+
+          cat >> .env <<EOF
+          NODE_ENV=production
+          LOG_LEVEL=info
+          SERVICE_PROXY_DOWNLOAD_URL_WINDOWS_X64=${BASE}/win-x64-morpheus-router-${V}.exe
+          SERVICE_PROXY_DOWNLOAD_URL_MAC_ARM64=${BASE}/mac-arm64-morpheus-router-${V}
+          SERVICE_PROXY_DOWNLOAD_URL_MAC_X64=${BASE}/mac-x64-morpheus-router-${V}
+          EOF
+
+          echo "--- .env ---"; cat .env
+
+      # Cross-platform version stamp. Upstream uses `sed -i` / `sed -i ""`,
+      # which need different syntax per OS; node needs none.
+      - name: Stamp version into package.json
+        if: matrix.enabled == true || matrix.enabled == 'true'
+        working-directory: ui-desktop
+        env:
+          V: ${{ needs.setup.outputs.version }}
+        run: |
+          node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));p.version=process.env.V;fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\n')"
+          node -e "console.log('version =',require('./package.json').version)"
+
+      - name: Install dependencies
+        if: matrix.enabled == true || matrix.enabled == 'true'
+        working-directory: ui-desktop
+        run: yarn install --network-timeout 600000 --frozen-lockfile
+
+      - name: Build installer
+        if: matrix.enabled == true || matrix.enabled == 'true'
+        working-directory: ui-desktop
+        env:
+          # No signing identity exists on a hosted runner. Without this,
+          # electron-builder can spend a long time probing the keychain.
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: yarn ${{ matrix.script }}
+
+      - name: Confirm the artifact exists
+        if: matrix.enabled == true || matrix.enabled == 'true'
+        working-directory: ui-desktop
+        run: |
+          ls -la dist/
+          test -f "dist/${{ matrix.artifact }}" \
+            || { echo "::error::Expected dist/${{ matrix.artifact }} — check electron.builder.config.ts artifactName"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.enabled == true || matrix.enabled == 'true'
+        with:
+          name: ${{ matrix.artifact }}
+          path: ui-desktop/dist/${{ matrix.artifact }}
+          if-no-files-found: error
+
+      - name: Attach to the release
+        if: matrix.enabled == true || matrix.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ needs.setup.outputs.tag }}" "ui-desktop/dist/${{ matrix.artifact }}" --clobber
